@@ -7,11 +7,14 @@ Requires only the Python standard library (tkinter ships with Python).
 """
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
-import threading, queue, os, sys, re, time, logging
+from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
+import threading, queue, os, sys, re, time, logging, json
 from datetime import datetime, timedelta, timezone
 import urllib.request, urllib.error
 from xml.sax.saxutils import escape
+
+PROFILES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "hik_profiles.json")
 
 # ── dependency check ─────────────────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -294,6 +297,7 @@ class App(tk.Tk):
         self._rows      = []        # [{"seg": seg, "ch": int, "iid": str}]
         self._checked   = {}        # iid -> bool
         self._ch_names  = {}        # ch_int -> label string
+        self._profiles  = self._load_profiles()
         self._q         = queue.Queue()
         self._stop      = threading.Event()
 
@@ -339,6 +343,20 @@ class App(tk.Tk):
         f = ttk.LabelFrame(parent, text="Device Connection", padding=8)
         f.pack(fill="x", pady=(0, 8))
 
+        # Row 0 — profile bar
+        ttk.Label(f, text="Profile").grid(row=0, column=0, sticky="e", padx=(0, 4))
+        self.v_profile = tk.StringVar()
+        self.cmb_profile = ttk.Combobox(
+            f, textvariable=self.v_profile, width=22, state="readonly")
+        self.cmb_profile.grid(row=0, column=1, sticky="ew", padx=(0, 6))
+        self.cmb_profile.bind("<<ComboboxSelected>>", self._on_profile_select)
+        ttk.Button(f, text="Save", command=self._save_profile).grid(
+            row=0, column=2, padx=(0, 4))
+        ttk.Button(f, text="Delete", command=self._delete_profile).grid(
+            row=0, column=3, padx=(0, 10))
+        self._refresh_profile_combo()
+
+        # Row 1 — connection fields
         fields = [
             ("Host",     "v_host", 18, "192.168.2.241", False),
             ("Port",     "v_port",  6, "8080",          False),
@@ -347,26 +365,26 @@ class App(tk.Tk):
         ]
         col = 0
         for label, attr, width, default, secret in fields:
-            ttk.Label(f, text=label).grid(row=0, column=col,   sticky="e", padx=(0, 4))
+            ttk.Label(f, text=label).grid(row=1, column=col,   sticky="e", padx=(0, 4))
             var = tk.StringVar(value=default)
             setattr(self, attr, var)
             kw = {"show": "●"} if secret else {}
             ttk.Entry(f, textvariable=var, width=width, **kw).grid(
-                row=0, column=col+1, sticky="ew", padx=(0, 10))
+                row=1, column=col+1, sticky="ew", padx=(0, 10))
             col += 2
 
         self.btn_connect = ttk.Button(f, text="Connect", command=self._do_connect)
-        self.btn_connect.grid(row=0, column=col, padx=(4, 0))
+        self.btn_connect.grid(row=1, column=col, padx=(4, 0))
 
         self.btn_detect = ttk.Button(
             f, text="Detect Channels", command=self._do_detect, state="disabled")
-        self.btn_detect.grid(row=0, column=col+1, padx=(6, 0))
+        self.btn_detect.grid(row=1, column=col+1, padx=(6, 0))
 
         for c in (1, 3, 5, 7):
             f.columnconfigure(c, weight=1)
 
         self.lbl_status = ttk.Label(f, text="Not connected", foreground="#888888")
-        self.lbl_status.grid(row=1, column=0, columnspan=col+2, sticky="w", pady=(6, 0))
+        self.lbl_status.grid(row=2, column=0, columnspan=col+2, sticky="w", pady=(6, 0))
 
     # ── 2. Query ──────────────────────────────────────────────────────────
 
@@ -478,9 +496,10 @@ class App(tk.Tk):
             row=0, column=1, columnspan=3, sticky="ew", padx=(0, 4))
         ttk.Button(f, text="Browse…", command=self._browse).grid(row=0, column=4)
 
-        self.v_convert = tk.BooleanVar(value=False)
-        self.v_keepraw = tk.BooleanVar(value=False)
-        self.v_limit   = tk.StringVar(value="0")
+        self.v_convert      = tk.BooleanVar(value=False)
+        self.v_keepraw      = tk.BooleanVar(value=False)
+        self.v_skip_existing = tk.BooleanVar(value=True)
+        self.v_limit        = tk.StringVar(value="0")
 
         ttk.Checkbutton(f, text="Convert to MP4  (requires ffmpeg)",
                         variable=self.v_convert,
@@ -492,6 +511,10 @@ class App(tk.Tk):
             variable=self.v_keepraw, state="disabled")
         self.cb_keepraw.grid(row=2, column=0, columnspan=2, sticky="w")
 
+        ttk.Checkbutton(f, text="Skip already-downloaded files",
+                        variable=self.v_skip_existing).grid(
+            row=3, column=0, columnspan=2, sticky="w")
+
         ttk.Label(f, text="Bandwidth limit (MB/s, 0 = unlimited)").grid(
             row=1, column=2, sticky="e", padx=(16, 4), pady=(6, 0))
         ttk.Entry(f, textvariable=self.v_limit, width=6).grid(
@@ -500,7 +523,7 @@ class App(tk.Tk):
         f.columnconfigure(1, weight=1)
 
         btn_row = ttk.Frame(f)
-        btn_row.grid(row=3, column=0, columnspan=5, sticky="ew", pady=(10, 0))
+        btn_row.grid(row=4, column=0, columnspan=5, sticky="ew", pady=(10, 0))
 
         self.btn_dl = ttk.Button(
             btn_row, text="Download Selected",
@@ -625,6 +648,76 @@ class App(tk.Tk):
             else:
                 self._q.put(("log", "Channel names cleared — using defaults.", "info"))
         ChannelNamesDialog(self, channels, self._ch_names, on_save)
+
+    # ── profile helpers ───────────────────────────────────────────────────
+    def _load_profiles(self):
+        try:
+            with open(PROFILES_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _persist_profiles(self):
+        try:
+            with open(PROFILES_FILE, "w") as f:
+                json.dump(self._profiles, f, indent=2)
+        except Exception as e:
+            messagebox.showerror("Profile save error", str(e))
+
+    def _refresh_profile_combo(self):
+        names = sorted(self._profiles.keys())
+        self.cmb_profile["values"] = names
+
+    def _on_profile_select(self, _event=None):
+        name = self.v_profile.get()
+        p = self._profiles.get(name)
+        if not p:
+            return
+        self.v_host.set(p.get("host", ""))
+        self.v_port.set(p.get("port", "8080"))
+        self.v_user.set(p.get("user", "admin"))
+        self.v_pass.set(p.get("password", ""))
+        if p.get("channels"):
+            self.v_channels.set(p["channels"])
+        if p.get("save_dir"):
+            self.v_savedir.set(p["save_dir"])
+        self._q.put(("log", f"Profile loaded: {name}", "info"))
+
+    def _save_profile(self):
+        name = simpledialog.askstring(
+            "Save Profile", "Profile name:",
+            initialvalue=self.v_profile.get() or "")
+        if not name:
+            return
+        name = name.strip()
+        if not name:
+            return
+        self._profiles[name] = {
+            "host":     self.v_host.get().strip(),
+            "port":     self.v_port.get().strip(),
+            "user":     self.v_user.get().strip(),
+            "password": self.v_pass.get(),
+            "channels": self.v_channels.get().strip(),
+            "save_dir": self.v_savedir.get().strip(),
+        }
+        self._persist_profiles()
+        self._refresh_profile_combo()
+        self.v_profile.set(name)
+        self._q.put(("log", f"Profile saved: {name}", "ok"))
+
+    def _delete_profile(self):
+        name = self.v_profile.get()
+        if not name or name not in self._profiles:
+            messagebox.showinfo("No profile", "Select a profile to delete.")
+            return
+        if not messagebox.askyesno("Delete profile",
+                f"Delete profile '{name}'?"):
+            return
+        del self._profiles[name]
+        self._persist_profiles()
+        self._refresh_profile_combo()
+        self.v_profile.set("")
+        self._q.put(("log", f"Profile deleted: {name}", "info"))
 
     # ── helpers ───────────────────────────────────────────────────────────
     def _toggle_convert(self):
@@ -992,10 +1085,11 @@ class App(tk.Tk):
         threading.Thread(
             target=self._dl_worker,
             args=(selected, save_dir,
-                  self.v_convert.get(), self.v_keepraw.get(), limit_mbps),
+                  self.v_convert.get(), self.v_keepraw.get(),
+                  limit_mbps, self.v_skip_existing.get()),
             daemon=True).start()
 
-    def _dl_worker(self, selected, save_dir, convert, keep_raw, limit_mbps):
+    def _dl_worker(self, selected, save_dir, convert, keep_raw, limit_mbps, skip_existing):
         total  = len(selected)
         done   = 0
         ok_ct  = err_ct = 0
@@ -1021,16 +1115,18 @@ class App(tk.Tk):
             if os.path.exists(final) and os.path.getsize(final) > 0:
                 m = re.search(r'[?&]size=(\d+)', seg.playback_uri)
                 exp = int(m.group(1)) if m else 0
-                if exp == 0 or os.path.getsize(final) >= exp:
+                already_complete = (exp == 0 or os.path.getsize(final) >= exp)
+                if already_complete or skip_existing:
+                    reason = "complete" if already_complete else "exists (skip)"
                     self._q.put(("log",
-                        f"[{idx}/{total}] Skip (complete): {os.path.basename(final)}",
+                        f"[{idx}/{total}] Skip ({reason}): {os.path.basename(final)}",
                         "info"))
                     ok_ct += 1
                     done += 1
                     self._q.put(("overall_prog", done, total))
                     continue
 
-            resuming = os.path.exists(ps) and os.path.getsize(ps) > 0
+            resuming = (not skip_existing) and os.path.exists(ps) and os.path.getsize(ps) > 0
             action   = "Resuming" if resuming else "Downloading"
             size_s   = f"{seg.size_mb:.1f} MB" if seg.size_mb > 0 else "?"
             self._q.put(("log",
