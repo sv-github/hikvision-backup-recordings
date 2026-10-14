@@ -1,0 +1,5 @@
+__pycache__/ 
+*.pyc 
+*.ps 
+*.mp4 
+NVR-Backup/ 
