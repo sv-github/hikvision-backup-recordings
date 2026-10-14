@@ -1457,12 +1457,50 @@ class App(tk.Tk):
                 self._q.put(("file_prog", label, pct))
 
             os.makedirs(d_dir, exist_ok=True)
+
+            MAX_RETRIES = 3
+            RETRY_DELAY = 20   # seconds between attempts
+            nb = None
+            last_exc = None
+
+            for attempt in range(1, MAX_RETRIES + 1):
+                if self._stop.is_set():
+                    break
+                try:
+                    nb = download_with_resume(
+                        self.client, seg.playback_uri, ps,
+                        progress_cb=prog,
+                        limit_mbps=limit_mbps,
+                        stop_event=self._stop)
+                    last_exc = None
+                    break  # success
+                except (InterruptedError, DownloadIncompleteError):
+                    last_exc = sys.exc_info()[1]
+                    break   # don't retry these — handled below
+                except Exception as e:
+                    last_exc = e
+                    if attempt < MAX_RETRIES:
+                        self._q.put(("log",
+                            f"    Network error (attempt {attempt}/{MAX_RETRIES}): {e}", "warn"))
+                        # Countdown — log every 5 s, check stop every second
+                        for remaining in range(RETRY_DELAY, 0, -1):
+                            if self._stop.is_set():
+                                break
+                            if remaining % 5 == 0 or remaining <= 3:
+                                self._q.put(("log",
+                                    f"    Retrying in {remaining}s … (press Stop to cancel)",
+                                    "warn"))
+                            time.sleep(1)
+                    else:
+                        self._q.put(("log",
+                            f"    Failed after {MAX_RETRIES} attempts: {e}", "err"))
+
+            if self._stop.is_set():
+                break
+
             try:
-                nb = download_with_resume(
-                    self.client, seg.playback_uri, ps,
-                    progress_cb=prog,
-                    limit_mbps=limit_mbps,
-                    stop_event=self._stop)
+                if last_exc is not None:
+                    raise last_exc
 
                 self._q.put(("log",
                     f"    ✓  {nb/1_048_576:.1f} MB  →  {ps}", "ok"))
