@@ -845,7 +845,7 @@ class App(tk.Tk):
         for ch in channels:
             self._q.put(("log", f"  Scanning channel {ch} …", "info"))
             try:
-                segs = self.client.search_recordings(ch, start, end, max_results=5000)
+                segs = self.client.search_recordings(ch, start, end, max_results=10000)
                 for seg in segs:
                     if seg.start_time:
                         try:
@@ -924,7 +924,7 @@ class App(tk.Tk):
         for ch in channels:
             try:
                 segs = self.client.search_recordings(
-                    ch, self.start_utc, self.end_utc, max_results=2000)
+                    ch, self.start_utc, self.end_utc, max_results=10000)
                 self._q.put(("log",
                     f"Channel {ch}: {len(segs)} segment(s)  "
                     f"(~{sum(s.size_mb for s in segs):.0f} MB)", "info"))
