@@ -984,6 +984,57 @@ class App(tk.Tk):
         self._thumb_label.config(image=photo, text="")
 
     # ── play ──────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # MP4 conversion helper
+    # ------------------------------------------------------------------
+    def _ps_to_mp4(self, ps_path: str, mp4_path: str) -> bool:
+        """Convert a Hikvision .ps file to .mp4 using ffmpeg.
+
+        Hikvision MPEG-PS files need the demuxer forced with -f mpegps.
+        We try twice:
+          Pass 1 — copy video + transcode audio to AAC (handles most files)
+          Pass 2 — copy video + no audio (if audio causes an error)
+        Returns True on success, False if ffmpeg is not found or both
+        passes fail.
+        """
+        if not ps_path or not os.path.exists(ps_path):
+            return False
+
+        base_cmd = ["ffmpeg", "-y", "-f", "mpeg", "-i", ps_path]
+
+        passes = [
+            base_cmd + ["-c:v", "copy", "-c:a", "aac", "-b:a", "128k", mp4_path],
+            base_cmd + ["-c:v", "copy", "-an", mp4_path],
+        ]
+
+        for attempt, cmd in enumerate(passes, 1):
+            try:
+                result = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=600,
+                )
+                if result.returncode == 0 and os.path.exists(mp4_path):
+                    return True
+                # Log stderr for diagnosis (last 20 lines)
+                err_tail = (result.stderr or b"").decode(errors="replace")
+                err_lines = [l for l in err_tail.splitlines() if l.strip()][-20:]
+                self._q.put(("log",
+                    f"    ffmpeg pass {attempt} failed (rc={result.returncode}):",
+                    "warn"))
+                for line in err_lines:
+                    self._q.put(("log", f"      {line}", "warn"))
+            except FileNotFoundError:
+                self._q.put(("log",
+                    "    ffmpeg not found — install it and add to PATH", "warn"))
+                return False
+            except subprocess.TimeoutExpired:
+                self._q.put(("log", "    ffmpeg timed out", "warn"))
+                return False
+
+        return False
+
     def _do_play(self):
         row = self._sel_row
         if not row:
@@ -1420,7 +1471,7 @@ class App(tk.Tk):
 
                 if convert:
                     self._q.put(("log", "    Converting to MP4 …", "info"))
-                    if convert_to_mp4(ps, mp4):
+                    if self._ps_to_mp4(ps, mp4):
                         self._q.put(("log", f"    ✓  {mp4}", "ok"))
                         if not keep_raw:
                             os.remove(ps)
