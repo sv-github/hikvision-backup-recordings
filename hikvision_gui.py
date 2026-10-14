@@ -780,7 +780,7 @@ class App(tk.Tk):
             hour=0, minute=0, second=0, microsecond=0)
         probe_end   = probe_start + timedelta(seconds=1)
 
-        for ch in range(1, 33):
+        for ch in range(1, 65):
             try:
                 self.client.search_recordings(ch, probe_start, probe_end,
                                               max_results=1)
