@@ -3,3 +3,4 @@ __pycache__/
 *.ps 
 *.mp4 
 NVR-Backup/ 
+hik_profiles.json 
