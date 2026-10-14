@@ -296,13 +296,18 @@ class App(tk.Tk):
         self.btn_connect = ttk.Button(f, text="Connect", command=self._do_connect)
         self.btn_connect.grid(row=0, column=col, padx=(4, 0))
 
+        self.btn_detect = ttk.Button(
+            f, text="Detect Channels", command=self._do_detect, state="disabled")
+        self.btn_detect.grid(row=0, column=col+1, padx=(6, 0))
+
         for c in (1, 3, 5, 7):
             f.columnconfigure(c, weight=1)
 
         self.lbl_status = ttk.Label(f, text="Not connected", foreground="#888888")
-        self.lbl_status.grid(row=1, column=0, columnspan=col+1, sticky="w", pady=(6, 0))
+        self.lbl_status.grid(row=1, column=0, columnspan=col+2, sticky="w", pady=(6, 0))
 
     # ── 2. Query ──────────────────────────────────────────────────────────
+
     def _build_query(self, parent):
         f = ttk.LabelFrame(parent, text="Search", padding=8)
         f.pack(fill="x", pady=(0, 8))
@@ -492,6 +497,7 @@ class App(tk.Tk):
                 elif kind == "connected":
                     self.btn_search.config(state="normal")
                     self.btn_list_dates.config(state="normal")
+                    self.btn_detect.config(state="normal")
 
                 elif kind == "search_done":
                     self._on_search_done()
@@ -515,6 +521,9 @@ class App(tk.Tk):
 
                 elif kind == "list_dates_err":
                     self._on_list_dates_err(msg[1])
+
+                elif kind == "detect_done":
+                    self._on_detect_done(msg[1])
 
         except queue.Empty:
             pass
@@ -619,6 +628,7 @@ class App(tk.Tk):
         self.btn_connect.config(state="disabled")
         self.btn_search.config(state="disabled")
         self.btn_list_dates.config(state="disabled")
+        self.btn_detect.config(state="disabled")
         self._q.put(("status", "Connecting…", "#e67e22"))
         threading.Thread(target=self._connect_worker, daemon=True).start()
 
@@ -662,6 +672,51 @@ class App(tk.Tk):
 
         finally:
             self.after(0, lambda: self.btn_connect.config(state="normal"))
+
+    # ── Detect Channels ───────────────────────────────────────────────────
+    def _do_detect(self):
+        self.btn_detect.config(state="disabled")
+        self._q.put(("log", "Detecting channels …", "info"))
+        threading.Thread(target=self._detect_worker, daemon=True).start()
+
+    def _detect_worker(self):
+        """
+        Try channels 1-32. For each, do a tiny 1-second search window; if it
+        returns without error the channel exists. Collect all that respond.
+        Uses the ISAPI /ContentMgmt/search endpoint via search_recordings().
+        """
+        found = []
+        probe_start = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        probe_end   = probe_start + timedelta(seconds=1)
+
+        for ch in range(1, 33):
+            try:
+                self.client.search_recordings(ch, probe_start, probe_end,
+                                              max_results=1)
+                found.append(ch)
+                self._q.put(("log", f"  Channel {ch}: ✓ found", "ok"))
+            except Exception as e:
+                err = str(e).lower()
+                # "no such channel", 400, 404 → channel doesn't exist; stop early
+                if any(k in err for k in ("no such", "invalid", "404", "400")):
+                    if ch > 4:   # give up after first gap past ch4
+                        break
+                # other errors (timeout, auth) → skip silently
+        self._q.put(("detect_done", found))
+
+    def _on_detect_done(self, found):
+        self.btn_detect.config(state="normal")
+        if not found:
+            messagebox.showinfo("No channels found",
+                "Could not detect any channels.\n"
+                "Try entering channel numbers manually.")
+            return
+        ch_str = ",".join(str(c) for c in found)
+        self.v_channels.set(ch_str)
+        self._q.put(("log",
+            f"Detected {len(found)} channel(s): {ch_str} — Channels field updated.",
+            "ok"))
 
     # ── List Available Dates ──────────────────────────────────────────────
     def _do_list_dates(self):
@@ -952,6 +1007,7 @@ class App(tk.Tk):
         self.btn_search.config(state="normal")
         self.btn_connect.config(state="normal")
         self.btn_list_dates.config(state="normal")
+        self.btn_detect.config(state="normal")
         self.btn_stop.config(state="disabled")
 
     def _do_stop(self):
