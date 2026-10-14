@@ -1,0 +1,24 @@
+# Hikvision Backup Recordings — Python dependencies
+#
+# All core dependencies are part of the Python standard library (Python 3.8+).
+# No pip install is required to run the GUI or CLI.
+#
+# Standard library modules used:
+#   tkinter       — desktop GUI (ships with Python on Windows/macOS;
+#                   on Linux install with: sudo apt install python3-tk)
+#   threading     — background workers
+#   queue         — thread-safe communication
+#   urllib        — HTTP requests + Digest Auth
+#   xml.sax       — XML escaping for ISAPI requests
+#   datetime      — date/time handling
+#   re, os, sys, time — general utilities
+#
+# Optional — only needed for MP4 conversion:
+#   ffmpeg        — must be installed separately and available in PATH
+#                   Windows:  winget install ffmpeg
+#                   macOS:    brew install ffmpeg
+#                   Linux:    sudo apt install ffmpeg
+#
+# Required external file (not on PyPI):
+#   pure_hik_client.py  — from https://github.com/crazy3tr/OpenHik-DVR
+#                         Place in the same folder as hikvision_gui.py
