@@ -8,7 +8,7 @@ Requires only the Python standard library (tkinter ships with Python).
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
-import threading, queue, os, sys, re, time, logging, json, subprocess
+import threading, queue, os, sys, re, time, logging, json, subprocess, csv
 from datetime import datetime, timedelta, timezone
 import urllib.request, urllib.error
 from xml.sax.saxutils import escape
@@ -310,6 +310,7 @@ class App(tk.Tk):
         self._sel_row    = None   # currently selected row dict
         self._q          = queue.Queue()
         self._stop       = threading.Event()
+        self._session_log_name = f"hik_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
         self._setup_style()
         self._build()
@@ -633,6 +634,12 @@ class App(tk.Tk):
             state="disabled", style="Stop.TButton")
         self.btn_stop.pack(side="left", padx=(8, 0))
 
+        self.btn_export_csv = ttk.Button(
+            btn_row, text="Export CSV",
+            command=self._export_csv,
+            state="disabled")
+        self.btn_export_csv.pack(side="left", padx=(8, 0))
+
     # ── 5. Progress ───────────────────────────────────────────────────────
     def _build_progress(self, parent):
         f = ttk.Frame(parent)
@@ -734,6 +741,16 @@ class App(tk.Tk):
         self.log_box.insert("end", f"{ts}  {text}\n", tag)
         self.log_box.see("end")
         self.log_box.config(state="disabled")
+        # Mirror to log file in the save folder (if one is set)
+        save_dir = self.v_savedir.get().strip() if hasattr(self, "v_savedir") else ""
+        if save_dir:
+            try:
+                os.makedirs(save_dir, exist_ok=True)
+                log_path = os.path.join(save_dir, self._session_log_name)
+                with open(log_path, "a", encoding="utf-8") as lf:
+                    lf.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  {text}\n")
+            except Exception:
+                pass  # never let log file errors crash the UI
 
     # ── channel name helpers ──────────────────────────────────────────────
     def _ch_name(self, ch):
@@ -866,6 +883,7 @@ class App(tk.Tk):
         if total == 0:
             self.lbl_sel.config(text="No recordings loaded", foreground="#888888")
             self.btn_dl.config(state="disabled", text="Download Selected")
+            self.btn_export_csv.config(state="disabled")
         else:
             self.lbl_sel.config(
                 text=f"{sel_cnt} of {total} selected  (~{sel_mb:.0f} MB)",
@@ -873,6 +891,7 @@ class App(tk.Tk):
             self.btn_dl.config(
                 text=f"Download {sel_cnt} Selected",
                 state="normal" if sel_cnt > 0 else "disabled")
+            self.btn_export_csv.config(state="normal")
 
     def _quick_fill(self, days_ago):
         """Fill start=end=today-days_ago, or start=today-days_ago, end=today for last7d."""
@@ -1368,6 +1387,40 @@ class App(tk.Tk):
             var.set("—")
         self.btn_play.config(state="disabled")
         self._update_sel_label()
+
+    # ── Export CSV ────────────────────────────────────────────────────────
+    def _export_csv(self):
+        if not self._rows:
+            messagebox.showinfo("Nothing to export", "Run a search first.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save recording list",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialfile=f"recordings_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["Channel", "Channel Name", "Start", "End",
+                                 "Duration", "Size (MB)", "Playback URI"])
+                for row in self._rows:
+                    seg = row["seg"]
+                    ch  = row["ch"]
+                    writer.writerow([
+                        ch,
+                        self._ch_name(ch),
+                        seg.start_time or "",
+                        seg.end_time   or "",
+                        self._dur(seg.start_time, seg.end_time),
+                        f"{seg.size_mb:.2f}",
+                        seg.playback_uri or "",
+                    ])
+            self._q.put(("log", f"CSV exported: {path}", "ok"))
+            messagebox.showinfo("Exported", f"Saved {len(self._rows)} rows to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Export failed", str(e))
 
     # ── Download ──────────────────────────────────────────────────────────
     def _do_download(self):
