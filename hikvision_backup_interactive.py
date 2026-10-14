@@ -308,7 +308,18 @@ def download_segments(client, segments, ch, date_str, save_dir,
                 )
                 last_exc = None
                 break   # success
-            except (DownloadIncompleteError, KeyboardInterrupt):
+            except KeyboardInterrupt:
+                print()
+                try:
+                    ans = input("    Interrupted — skip this file and continue? [Y/n]: ").strip().lower()
+                except (KeyboardInterrupt, EOFError):
+                    ans = "n"
+                if ans in ("", "y"):
+                    last_exc = "skip"   # sentinel: skipped by user, not an error
+                else:
+                    last_exc = KeyboardInterrupt()
+                break
+            except DownloadIncompleteError:
                 last_exc = sys.exc_info()[1]
                 break   # don't retry — handled below
             except Exception as e:
@@ -326,12 +337,15 @@ def download_segments(client, segments, ch, date_str, save_dir,
 
         print()
 
-        if isinstance(last_exc, DownloadIncompleteError):
+        if last_exc == "skip":
+            log.info("    Skipped by user.")
+            total_err += 1
+        elif isinstance(last_exc, DownloadIncompleteError):
             log.warning(f"    Partial saved (will resume next run): {last_exc}")
             total_err += 1
         elif isinstance(last_exc, KeyboardInterrupt):
-            log.warning("    Interrupted by user — stopping.")
-            break
+            log.warning("    Stopped by user.")
+            raise last_exc   # propagate — exits channel loop in main()
         elif last_exc is not None:
             log.error(f"    Failed: {last_exc}")
             if os.path.exists(dest_ps) and os.path.getsize(dest_ps) == 0:
@@ -552,4 +566,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        sys.exit(0)
