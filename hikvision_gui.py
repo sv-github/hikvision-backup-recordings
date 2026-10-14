@@ -8,10 +8,18 @@ Requires only the Python standard library (tkinter ships with Python).
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
-import threading, queue, os, sys, re, time, logging, json
+import threading, queue, os, sys, re, time, logging, json, subprocess
 from datetime import datetime, timedelta, timezone
 import urllib.request, urllib.error
 from xml.sax.saxutils import escape
+
+# Optional: Pillow for thumbnail display (pip install Pillow)
+try:
+    from PIL import Image, ImageTk
+    import io as _pil_io
+    _PIL_OK = True
+except ImportError:
+    _PIL_OK = False
 
 PROFILES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "hik_profiles.json")
@@ -289,17 +297,19 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Hikvision NVR Backup")
-        self.geometry("980x830")
-        self.minsize(760, 640)
+        self.geometry("1020x980")
+        self.minsize(820, 800)
 
         self.client     = None
         self.start_utc  = self.end_utc = None
         self._rows      = []        # [{"seg": seg, "ch": int, "iid": str}]
         self._checked   = {}        # iid -> bool
         self._ch_names  = {}        # ch_int -> label string
-        self._profiles  = self._load_profiles()
-        self._q         = queue.Queue()
-        self._stop      = threading.Event()
+        self._profiles   = self._load_profiles()
+        self._thumb_img  = None   # keep PhotoImage reference alive
+        self._sel_row    = None   # currently selected row dict
+        self._q          = queue.Queue()
+        self._stop       = threading.Event()
 
         self._setup_style()
         self._build()
@@ -328,20 +338,51 @@ class App(tk.Tk):
 
     # ── build ─────────────────────────────────────────────────────────────
     def _build(self):
-        outer = ttk.Frame(self, padding=10)
-        outer.pack(fill="both", expand=True)
+        # Scrollable canvas so the UI fits any screen height
+        container = ttk.Frame(self)
+        container.pack(fill="both", expand=True)
+
+        vsb = ttk.Scrollbar(container, orient="vertical")
+        vsb.pack(side="right", fill="y")
+
+        self._canvas = tk.Canvas(container, yscrollcommand=vsb.set,
+                                  highlightthickness=0)
+        self._canvas.pack(side="left", fill="both", expand=True)
+        vsb.config(command=self._canvas.yview)
+
+        outer = ttk.Frame(self._canvas, padding=6)
+        self._scroll_win = self._canvas.create_window(
+            (0, 0), window=outer, anchor="nw")
+
+        outer.bind("<Configure>", self._on_frame_configure)
+        self._canvas.bind("<Configure>", self._on_canvas_configure)
+
+        # Mouse-wheel scrolling
+        self._canvas.bind_all("<MouseWheel>",
+            lambda e: self._canvas.yview_scroll(-1 * (e.delta // 120), "units"))
+        self._canvas.bind_all("<Button-4>",
+            lambda e: self._canvas.yview_scroll(-1, "units"))
+        self._canvas.bind_all("<Button-5>",
+            lambda e: self._canvas.yview_scroll(1, "units"))
 
         self._build_connection(outer)
         self._build_query(outer)
         self._build_tree(outer)
+        self._build_detail(outer)
         self._build_options(outer)
         self._build_progress(outer)
         self._build_log(outer)
 
+    def _on_frame_configure(self, _event=None):
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event):
+        self._canvas.itemconfig(self._scroll_win, width=event.width)
+
     # ── 1. Connection ─────────────────────────────────────────────────────
     def _build_connection(self, parent):
-        f = ttk.LabelFrame(parent, text="Device Connection", padding=8)
-        f.pack(fill="x", pady=(0, 8))
+        f = ttk.LabelFrame(parent, text="Device Connection", padding=6)
+        f.pack(fill="x", pady=(0, 4))
 
         # Row 0 — profile bar
         ttk.Label(f, text="Profile").grid(row=0, column=0, sticky="e", padx=(0, 4))
@@ -384,13 +425,23 @@ class App(tk.Tk):
             f.columnconfigure(c, weight=1)
 
         self.lbl_status = ttk.Label(f, text="Not connected", foreground="#888888")
-        self.lbl_status.grid(row=2, column=0, columnspan=col+2, sticky="w", pady=(6, 0))
+        self.lbl_status.grid(row=2, column=0, columnspan=col+2, sticky="w", pady=(6, 2))
+
+        # Storage usage bar (populated after connect)
+        stor_row = ttk.Frame(f)
+        stor_row.grid(row=3, column=0, columnspan=col+2, sticky="ew", pady=(0, 2))
+        ttk.Label(stor_row, text="Storage:").pack(side="left", padx=(0, 6))
+        self.pb_storage = ttk.Progressbar(stor_row, mode="determinate",
+                                          length=180, maximum=100)
+        self.pb_storage.pack(side="left")
+        self.lbl_storage = ttk.Label(stor_row, text="—", foreground="#888888")
+        self.lbl_storage.pack(side="left", padx=(8, 0))
 
     # ── 2. Query ──────────────────────────────────────────────────────────
 
     def _build_query(self, parent):
-        f = ttk.LabelFrame(parent, text="Search", padding=8)
-        f.pack(fill="x", pady=(0, 8))
+        f = ttk.LabelFrame(parent, text="Search", padding=6)
+        f.pack(fill="x", pady=(0, 4))
 
         today = datetime.now(timezone.utc)
         yd    = (today - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -443,14 +494,16 @@ class App(tk.Tk):
 
     # ── 3. Recordings treeview ────────────────────────────────────────────
     def _build_tree(self, parent):
-        outer = ttk.LabelFrame(parent, text="Recordings", padding=8)
-        outer.pack(fill="both", expand=True, pady=(0, 8))
+        outer = ttk.LabelFrame(parent, text="Recordings", padding=6)
+        outer.pack(fill="both", expand=True, pady=(0, 4))
 
         bar = ttk.Frame(outer)
         bar.pack(fill="x", pady=(0, 6))
         ttk.Button(bar, text=f"{CHK_ON} Select All",  command=self._select_all ).pack(side="left", padx=(0, 4))
         ttk.Button(bar, text=f"{CHK_OFF} Select None", command=self._select_none).pack(side="left", padx=(0, 4))
-        ttk.Button(bar, text="✏️ Name Channels", command=self._open_name_channels).pack(side="left")
+        ttk.Button(bar, text="✏️ Name Channels", command=self._open_name_channels).pack(side="left", padx=(0, 4))
+        self.btn_play = ttk.Button(bar, text="▶ Play", command=self._do_play, state="disabled")
+        self.btn_play.pack(side="left")
         self.lbl_sel = ttk.Label(bar, text="No recordings loaded", foreground="#888888")
         self.lbl_sel.pack(side="right")
 
@@ -460,7 +513,7 @@ class App(tk.Tk):
         cols = ("sel", "ch", "start", "end", "dur", "size")
         self.tree = ttk.Treeview(
             tree_wrap, columns=cols, show="headings",
-            selectmode="none", height=9)
+            selectmode="none", height=7)
 
         self.tree.heading("sel",   text=CHK_ON,        anchor="center")
         self.tree.heading("ch",    text="Ch",           anchor="center")
@@ -479,16 +532,59 @@ class App(tk.Tk):
         self.tree.tag_configure("on",  foreground="")
         self.tree.tag_configure("off", foreground="#aaaaaa")
         self.tree.bind("<Button-1>", self._tree_click)
+        self.tree.bind("<ButtonRelease-1>", self._tree_select)
         self.tree.pack(side="left", fill="both", expand=True)
 
         vsb = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.tree.yview)
         vsb.pack(side="right", fill="y")
         self.tree.configure(yscrollcommand=vsb.set)
 
+    # ── 3b. Detail panel (thumbnail + info) ──────────────────────────────
+    def _build_detail(self, parent):
+        f = ttk.LabelFrame(parent, text="Recording Preview", padding=6)
+        f.pack(fill="x", pady=(0, 4))
+
+        # Thumbnail pane
+        thumb_frame = ttk.Frame(f, width=150, height=90, relief="sunken",
+                                borderwidth=1)
+        thumb_frame.pack(side="left", padx=(0, 12))
+        thumb_frame.pack_propagate(False)
+
+        self._thumb_label = tk.Label(
+            thumb_frame,
+            text="Select a\nrecording",
+            fg="#aaaaaa", bg="#1a1a1a",
+            font=(*F_MONO[:1], F_MONO[1]-1),
+            anchor="center")
+        self._thumb_label.pack(fill="both", expand=True)
+
+        # Info grid
+        info = ttk.Frame(f)
+        info.pack(side="left", fill="both", expand=True)
+
+        labels = ("Channel", "Start", "End", "Duration", "Size", "Local file")
+        self._detail_vars = {}
+        for i, lbl in enumerate(labels):
+            ttk.Label(info, text=lbl + ":", foreground="#888888",
+                      font=(*F_UI[:1], F_UI[1]-1)).grid(
+                row=i, column=0, sticky="e", padx=(0, 6), pady=1)
+            var = tk.StringVar(value="—")
+            self._detail_vars[lbl] = var
+            ttk.Label(info, textvariable=var).grid(
+                row=i, column=1, sticky="w", pady=1)
+        info.columnconfigure(1, weight=1)
+
+        if not _PIL_OK:
+            ttk.Label(f,
+                text="📷 Install Pillow for thumbnails:\n  pip install Pillow",
+                foreground="#888888",
+                font=(*F_MONO[:1], F_MONO[1]-1),
+                justify="left").pack(side="right", padx=(12, 0))
+
     # ── 4. Download options ───────────────────────────────────────────────
     def _build_options(self, parent):
-        f = ttk.LabelFrame(parent, text="Download Options", padding=8)
-        f.pack(fill="x", pady=(0, 8))
+        f = ttk.LabelFrame(parent, text="Download Options", padding=6)
+        f.pack(fill="x", pady=(0, 4))
 
         ttk.Label(f, text="Save to").grid(row=0, column=0, sticky="e", padx=(0, 4))
         self.v_savedir = tk.StringVar(value=r"C:\NVR-Backup")
@@ -540,7 +636,7 @@ class App(tk.Tk):
     # ── 5. Progress ───────────────────────────────────────────────────────
     def _build_progress(self, parent):
         f = ttk.Frame(parent)
-        f.pack(fill="x", pady=(0, 8))
+        f.pack(fill="x", pady=(0, 4))
 
         self.lbl_file = ttk.Label(f, text="")
         self.lbl_file.pack(fill="x")
@@ -558,7 +654,7 @@ class App(tk.Tk):
         f.pack(fill="x")
 
         self.log_box = scrolledtext.ScrolledText(
-            f, height=7, font=F_MONO,
+            f, height=5, font=F_MONO,
             state="disabled", wrap="word",
             relief="flat", borderwidth=0)
         self.log_box.pack(fill="both", expand=True)
@@ -610,6 +706,23 @@ class App(tk.Tk):
 
                 elif kind == "detect_done":
                     self._on_detect_done(msg[1])
+
+                elif kind == "storage_info":
+                    total_gb, used_gb = msg[1], msg[2]
+                    if total_gb > 0:
+                        pct = min(100, used_gb / total_gb * 100)
+                        self.pb_storage["value"] = pct
+                        color = "#c0392b" if pct > 85 else "#e67e22" if pct > 70 else "#27ae60"
+                        self.lbl_storage.config(
+                            text=f"{used_gb:.0f} / {total_gb:.0f} GB  ({pct:.0f}% used)",
+                            foreground=color)
+
+                elif kind == "thumb_ready":
+                    self._on_thumb_ready(msg[1])
+
+                elif kind == "thumb_err":
+                    self._thumb_label.config(image="", text="No preview")
+                    self._thumb_img = None
 
         except queue.Empty:
             pass
@@ -776,6 +889,145 @@ class App(tk.Tk):
             raise ValueError("End date must be on or after start date.")
         return sd, ed + timedelta(days=1)   # end is inclusive → add 1 day for API
 
+    # ── treeview selection + detail panel ────────────────────────────────
+    def _tree_select(self, event):
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        row = next((r for r in self._rows if r.get("iid") == iid), None)
+        if not row:
+            return
+        self._sel_row = row
+        self.btn_play.config(state="normal")
+        seg = row["seg"]
+        ch  = row["ch"]
+
+        # Fill detail info
+        self._detail_vars["Channel"].set(self._ch_name(ch))
+        self._detail_vars["Start"].set(seg.start_time or "—")
+        self._detail_vars["End"].set(seg.end_time or "—")
+        self._detail_vars["Duration"].set(
+            self._fmt_dur(seg.start_time or "", seg.end_time or ""))
+        self._detail_vars["Size"].set(
+            f"{seg.size_mb:.1f} MB" if seg.size_mb > 0 else "?")
+
+        # Check if file exists locally
+        save_dir = self.v_savedir.get().strip()
+        safe = (seg.start_time or "unknown").replace(":", "-").replace("T", "_").rstrip("Z")[:19]
+        date_folder = (seg.start_time or "unknown")[:10]
+        ps  = os.path.join(save_dir, date_folder, f"ch{ch}", f"ch{ch}_{safe}.ps")
+        mp4 = os.path.splitext(ps)[0] + ".mp4"
+        if os.path.exists(mp4):
+            self._detail_vars["Local file"].set(f"✓ MP4  {mp4}")
+        elif os.path.exists(ps):
+            sz = os.path.getsize(ps)
+            self._detail_vars["Local file"].set(
+                f"✓ .ps  {sz/1_048_576:.1f} MB  {ps}")
+        else:
+            self._detail_vars["Local file"].set("Not downloaded")
+
+        # Fetch thumbnail in background
+        self._thumb_label.config(image="", text="Loading…", fg="#aaaaaa")
+        self._thumb_img = None
+        if self.client:
+            threading.Thread(
+                target=self._fetch_thumb_worker,
+                args=(ch, seg.start_time),
+                daemon=True).start()
+
+    def _fetch_thumb_worker(self, ch, start_time):
+        """Fetch a JPEG snapshot from the NVR for this channel/time."""
+        channel_id = ch * 100 + 1   # Hikvision: Ch 2 → 201
+
+        # Try historical snapshot first (recording time), then live
+        endpoints = []
+        if start_time:
+            t = start_time.rstrip("Z") if start_time.endswith("Z") else start_time
+            endpoints.append(
+                f"/ISAPI/ContentMgmt/StreamingProxy/channels/{channel_id}"
+                f"/picture?time={t}Z")
+        endpoints.append(f"/ISAPI/Streaming/channels/{channel_id}/picture")
+
+        jpeg_data = None
+        for ep in endpoints:
+            try:
+                req = urllib.request.Request(
+                    self.client.base_url + ep,
+                    headers={"User-Agent": "OpenHik-Client/1.0"})
+                with self.client.opener.open(req, timeout=8) as resp:
+                    jpeg_data = resp.read()
+                if jpeg_data and len(jpeg_data) > 100:
+                    break
+            except Exception:
+                jpeg_data = None
+                continue
+
+        if not jpeg_data:
+            self._q.put(("thumb_err",))
+            return
+
+        if not _PIL_OK:
+            # Show file-size as indication it worked
+            self._q.put(("thumb_err",))
+            return
+
+        try:
+            img = Image.open(_pil_io.BytesIO(jpeg_data))
+            img.thumbnail((160, 100), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            self._q.put(("thumb_ready", photo))
+        except Exception:
+            self._q.put(("thumb_err",))
+
+    def _on_thumb_ready(self, photo):
+        self._thumb_img = photo   # prevent GC
+        self._thumb_label.config(image=photo, text="")
+
+    # ── play ──────────────────────────────────────────────────────────────
+    def _do_play(self):
+        row = self._sel_row
+        if not row:
+            return
+        seg = row["seg"]
+        ch  = row["ch"]
+        save_dir = self.v_savedir.get().strip()
+        safe = (seg.start_time or "unknown").replace(":", "-").replace("T", "_").rstrip("Z")[:19]
+        date_folder = (seg.start_time or "unknown")[:10]
+        ps  = os.path.join(save_dir, date_folder, f"ch{ch}", f"ch{ch}_{safe}.ps")
+        mp4 = os.path.splitext(ps)[0] + ".mp4"
+
+        # Prefer MP4, then .ps
+        target = mp4 if os.path.exists(mp4) else ps if os.path.exists(ps) else None
+
+        if target:
+            try:
+                if sys.platform == "win32":
+                    os.startfile(target)
+                elif sys.platform == "darwin":
+                    subprocess.Popen(["open", target])
+                else:
+                    subprocess.Popen(["xdg-open", target])
+                self._q.put(("log", f"Opening: {target}", "info"))
+            except Exception as e:
+                messagebox.showerror("Playback error", str(e))
+        else:
+            # Not downloaded — offer to open stream in VLC
+            uri = seg.playback_uri if hasattr(seg, "playback_uri") else None
+            if uri and messagebox.askyesno(
+                    "File not downloaded",
+                    "This recording hasn't been downloaded yet.\n\n"
+                    "Try to open the NVR stream directly in VLC?"):
+                try:
+                    subprocess.Popen(["vlc", uri])
+                    self._q.put(("log", f"Opening stream in VLC: {uri}", "info"))
+                except FileNotFoundError:
+                    messagebox.showinfo(
+                        "VLC not found",
+                        f"Download the recording first, or open this URI manually in VLC:\n\n{uri}")
+            elif not uri:
+                messagebox.showinfo("Not downloaded",
+                    "Download this recording first before playing.")
+
     # ── treeview checkbox ─────────────────────────────────────────────────
     def _tree_click(self, event):
         col = self.tree.identify_column(event.x)
@@ -840,10 +1092,15 @@ class App(tk.Tk):
                 pass
 
             try:
-                for d in self.client.get_storage():
+                disks = self.client.get_storage()
+                total_gb = sum(d.capacity_gb for d in disks)
+                free_gb  = sum(d.free_space_mb / 1024 for d in disks)
+                used_gb  = total_gb - free_gb
+                for d in disks:
                     self._q.put(("log",
                         f"Storage: {d.name}  {d.capacity_gb:.0f} GB  "
                         f"({d.free_space_mb/1024:.0f} GB free)  {d.status}", "info"))
+                self._q.put(("storage_info", total_gb, used_gb))
             except Exception:
                 pass
 
@@ -1052,7 +1309,13 @@ class App(tk.Tk):
     def _clear_tree(self):
         for iid in self.tree.get_children():
             self.tree.delete(iid)
-        self._checked = {}
+        self._checked  = {}
+        self._sel_row  = None
+        self._thumb_img = None
+        self._thumb_label.config(image="", text="Select a\nrecording", fg="#aaaaaa")
+        for var in self._detail_vars.values():
+            var.set("—")
+        self.btn_play.config(state="disabled")
         self._update_sel_label()
 
     # ── Download ──────────────────────────────────────────────────────────

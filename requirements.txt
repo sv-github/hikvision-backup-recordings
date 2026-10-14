@@ -13,6 +13,10 @@
 #   datetime      — date/time handling
 #   re, os, sys, time — general utilities
 #
+# Optional — only needed for thumbnail previews:
+#   Pillow        — pip install Pillow
+#                   Without it the app still works; thumbnails show a placeholder.
+#
 # Optional — only needed for MP4 conversion:
 #   ffmpeg        — must be installed separately and available in PATH
 #                   Windows:  winget install ffmpeg
