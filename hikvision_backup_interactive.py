@@ -15,6 +15,7 @@ import re
 import time
 import logging
 import getpass
+import subprocess
 import urllib.request
 import urllib.error
 from xml.sax.saxutils import escape
@@ -22,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
-    from pure_hik_client import PureHikClient, convert_to_mp4, DownloadIncompleteError
+    from pure_hik_client import PureHikClient, DownloadIncompleteError
 except ImportError:
     print("ERROR: pure_hik_client.py not found in the same folder as this script.")
     sys.exit(1)
@@ -53,6 +54,36 @@ def ask_yn(prompt: str, default: bool = True) -> bool:
 def progress(downloaded_bytes: int, speed_mbs: float) -> None:
     mb = downloaded_bytes / (1024 * 1024)
     print(f"\r    {mb:7.1f} MB  @ {speed_mbs:.1f} MB/s    ", end="", flush=True)
+
+def ps_to_mp4(ps_path: str, mp4_path: str, log) -> bool:
+    """Convert a Hikvision .ps file to .mp4 using ffmpeg.
+    Tries audio-copy first, falls back to no-audio on failure."""
+    if not ps_path or not os.path.exists(ps_path):
+        return False
+    base_cmd = ["ffmpeg", "-y", "-f", "mpeg", "-i", ps_path]
+    passes = [
+        base_cmd + ["-c:v", "copy", "-c:a", "aac", "-b:a", "128k", mp4_path],
+        base_cmd + ["-c:v", "copy", "-an", mp4_path],
+    ]
+    for attempt, cmd in enumerate(passes, 1):
+        try:
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600)
+            if result.returncode == 0 and os.path.exists(mp4_path):
+                return True
+            err_tail = (result.stderr or b"").decode(errors="replace")
+            err_lines = [ln for ln in err_tail.splitlines() if ln.strip()][-20:]
+            log.warning(f"    ffmpeg pass {attempt} failed (rc={result.returncode}):")
+            for line in err_lines:
+                log.warning(f"      {line}")
+        except FileNotFoundError:
+            log.warning("    ffmpeg not found — install it and add to PATH")
+            return False
+        except subprocess.TimeoutExpired:
+            log.warning("    ffmpeg timed out")
+            return False
+    log.warning("    ffmpeg failed — raw .ps kept")
+    return False
+
 
 def fmt_duration(start_str: str, end_str: str) -> str:
     """Return HH:MM:SS duration string from two ISO-8601 UTC timestamps."""
@@ -86,7 +117,7 @@ def list_recordings(client: PureHikClient, channels: list[int],
     for ch in channels:
         print(f"\n  Channel {ch}:")
         try:
-            segments = client.search_recordings(ch, start_utc, end_utc, max_results=500)
+            segments = client.search_recordings(ch, start_utc, end_utc, max_results=10000)
         except Exception as e:
             print(f"    ERROR: {e}")
             continue
@@ -261,41 +292,66 @@ def download_segments(client, segments, ch, date_str, save_dir,
         log.info(f"  [{idx}/{len(segments)}] {action} {base_name}.ps  ({size_str})")
 
         os.makedirs(dest_dir, exist_ok=True)
-        try:
-            total_bytes = download_with_resume(
-                client, seg.playback_uri, dest_ps,
-                progress_callback=progress,
-                limit_mbps=limit_mbps,
-                verify_size=True,
-            )
-            print()
-            log.info(f"    ✓ {total_bytes/(1024*1024):.1f} MB  →  {dest_ps}")
 
-            if convert:
-                log.info("    Converting to MP4 ...")
-                ok = convert_to_mp4(dest_ps, dest_mp4)
-                if ok:
-                    log.info(f"    ✓ {dest_mp4}")
-                    if not keep_raw:
-                        os.remove(dest_ps)
+        MAX_RETRIES  = 3
+        RETRY_DELAY  = 20   # seconds between attempts
+        total_bytes  = None
+        last_exc     = None
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                total_bytes = download_with_resume(
+                    client, seg.playback_uri, dest_ps,
+                    progress_callback=progress,
+                    limit_mbps=limit_mbps,
+                    verify_size=True,
+                )
+                last_exc = None
+                break   # success
+            except (DownloadIncompleteError, KeyboardInterrupt):
+                last_exc = sys.exc_info()[1]
+                break   # don't retry — handled below
+            except Exception as e:
+                last_exc = e
+                print()
+                if attempt < MAX_RETRIES:
+                    log.warning(f"    Network error (attempt {attempt}/{MAX_RETRIES}): {e}")
+                    for remaining in range(RETRY_DELAY, 0, -1):
+                        if remaining % 5 == 0 or remaining <= 3:
+                            print(f"\r    Retrying in {remaining}s … (Ctrl-C to cancel)   ", end="", flush=True)
+                        time.sleep(1)
+                    print()
                 else:
-                    log.warning("    ffmpeg conversion failed — raw .ps kept")
+                    log.error(f"    Failed after {MAX_RETRIES} attempts: {e}")
 
-            total_ok += 1
+        print()
 
-        except DownloadIncompleteError as e:
-            print()
-            log.warning(f"    Partial saved (will resume next run): {e}")
+        if isinstance(last_exc, DownloadIncompleteError):
+            log.warning(f"    Partial saved (will resume next run): {last_exc}")
             total_err += 1
-        except Exception as e:
-            print()
-            log.error(f"    Failed: {e}")
+        elif isinstance(last_exc, KeyboardInterrupt):
+            log.warning("    Interrupted by user — stopping.")
+            break
+        elif last_exc is not None:
+            log.error(f"    Failed: {last_exc}")
             if os.path.exists(dest_ps) and os.path.getsize(dest_ps) == 0:
                 try:
                     os.remove(dest_ps)
                 except Exception:
                     pass
             total_err += 1
+        else:
+            log.info(f"    ✓ {total_bytes/(1024*1024):.1f} MB  →  {dest_ps}")
+
+            if convert:
+                log.info("    Converting to MP4 ...")
+                ok = ps_to_mp4(dest_ps, dest_mp4, log)
+                if ok:
+                    log.info(f"    ✓ {dest_mp4}")
+                    if not keep_raw:
+                        os.remove(dest_ps)
+
+            total_ok += 1
 
     return total_ok, total_err
 
@@ -438,7 +494,7 @@ def main():
     for ch in channels:
         log.info(f"\nChannel {ch}:")
         try:
-            segments = client.search_recordings(ch, start_utc, end_utc, max_results=500)
+            segments = client.search_recordings(ch, start_utc, end_utc, max_results=10000)
         except Exception as e:
             log.error(f"  Search failed: {e}")
             grand_err += 1

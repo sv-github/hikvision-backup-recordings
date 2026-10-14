@@ -1413,7 +1413,7 @@ class App(tk.Tk):
                         self._ch_name(ch),
                         seg.start_time or "",
                         seg.end_time   or "",
-                        self._dur(seg.start_time, seg.end_time),
+                        self._fmt_dur(seg.start_time, seg.end_time),
                         f"{seg.size_mb:.2f}",
                         seg.playback_uri or "",
                     ])
