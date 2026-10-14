@@ -129,16 +129,75 @@ else:
     F_MONO = ("Monospace",    9)
 
 
+# ── Channel Names dialog ──────────────────────────────────────────────────────
+class ChannelNamesDialog(tk.Toplevel):
+    """
+    Popup with one Entry per channel so the user can assign friendly labels.
+    e.g.  Ch 2 → "Front Gate"   Ch 3 → "Car Park"
+    Calls on_save(names_dict) where names_dict maps ch_int → label_str.
+    """
+    def __init__(self, parent, channels, current_names, on_save):
+        super().__init__(parent)
+        self.title("Name Channels")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        self._on_save = on_save
+        self._vars = {}   # ch_int → StringVar
+
+        ttk.Label(self,
+                  text="Give each channel a friendly name (leave blank to use default).",
+                  font=(*F_UI[:1], F_UI[1]-1),
+                  foreground="#555555").pack(anchor="w", padx=14, pady=(12, 6))
+
+        grid = ttk.Frame(self, padding=(14, 0, 14, 8))
+        grid.pack(fill="x")
+
+        for row_idx, ch in enumerate(sorted(channels)):
+            ttk.Label(grid, text=f"Ch {ch}", width=6, anchor="e").grid(
+                row=row_idx, column=0, sticky="e", padx=(0, 8), pady=3)
+            var = tk.StringVar(value=current_names.get(ch, ""))
+            self._vars[ch] = var
+            e = ttk.Entry(grid, textvariable=var, width=28)
+            e.grid(row=row_idx, column=1, sticky="ew", pady=3)
+            ttk.Label(grid, text=f"(default: Ch {ch})", foreground="#999999",
+                      font=(*F_UI[:1], F_UI[1]-1)).grid(
+                row=row_idx, column=2, padx=(8, 0), sticky="w")
+        grid.columnconfigure(1, weight=1)
+
+        btn_row = ttk.Frame(self, padding=(14, 0, 14, 12))
+        btn_row.pack(fill="x")
+        ttk.Button(btn_row, text="Save", style="Accent.TButton",
+                   command=self._save).pack(side="left")
+        ttk.Button(btn_row, text="Clear All",
+                   command=self._clear).pack(side="left", padx=(8, 0))
+        ttk.Button(btn_row, text="Cancel",
+                   command=self.destroy).pack(side="right")
+
+    def _save(self):
+        names = {ch: var.get().strip()
+                 for ch, var in self._vars.items()
+                 if var.get().strip()}
+        self._on_save(names)
+        self.destroy()
+
+    def _clear(self):
+        for var in self._vars.values():
+            var.set("")
+
+
 # ── Available Dates dialog ────────────────────────────────────────────────────
 class AvailableDatesDialog(tk.Toplevel):
     """
     Popup that shows which dates have recordings, per channel.
     User can double-click a date to auto-fill start/end in the main window.
     """
-    def __init__(self, parent, dates_by_ch, on_pick):
+    def __init__(self, parent, dates_by_ch, on_pick, ch_names=None):
         """
         dates_by_ch: dict  { ch_int: set_of_date_strings_YYYY_MM_DD }
         on_pick:     callable(date_str) called when user picks a date
+        ch_names:    optional dict { ch_int: label_str } for column headings
         """
         super().__init__(parent)
         self.title("Available Recording Dates")
@@ -148,6 +207,7 @@ class AvailableDatesDialog(tk.Toplevel):
         self.grab_set()
 
         self._on_pick = on_pick
+        self._ch_names = ch_names or {}
         self._build(dates_by_ch)
 
     def _build(self, dates_by_ch):
@@ -162,7 +222,8 @@ class AvailableDatesDialog(tk.Toplevel):
         # Build columns: Date | Ch1 | Ch2 | … (one column per channel)
         channels = sorted(dates_by_ch.keys())
         cols = ("date",) + tuple(f"ch{c}" for c in channels)
-        col_labels = ("Date",) + tuple(f"Ch {c}" for c in channels)
+        col_labels = ("Date",) + tuple(
+            self._ch_names.get(c, f"Ch {c}") for c in channels)
 
         frame = ttk.Frame(self)
         frame.pack(fill="both", expand=True, padx=12, pady=(0, 8))
@@ -232,6 +293,7 @@ class App(tk.Tk):
         self.start_utc  = self.end_utc = None
         self._rows      = []        # [{"seg": seg, "ch": int, "iid": str}]
         self._checked   = {}        # iid -> bool
+        self._ch_names  = {}        # ch_int -> label string
         self._q         = queue.Queue()
         self._stop      = threading.Event()
 
@@ -369,7 +431,8 @@ class App(tk.Tk):
         bar = ttk.Frame(outer)
         bar.pack(fill="x", pady=(0, 6))
         ttk.Button(bar, text=f"{CHK_ON} Select All",  command=self._select_all ).pack(side="left", padx=(0, 4))
-        ttk.Button(bar, text=f"{CHK_OFF} Select None", command=self._select_none).pack(side="left")
+        ttk.Button(bar, text=f"{CHK_OFF} Select None", command=self._select_none).pack(side="left", padx=(0, 4))
+        ttk.Button(bar, text="✏️ Name Channels", command=self._open_name_channels).pack(side="left")
         self.lbl_sel = ttk.Label(bar, text="No recordings loaded", foreground="#888888")
         self.lbl_sel.pack(side="right")
 
@@ -535,6 +598,33 @@ class App(tk.Tk):
         self.log_box.insert("end", f"{ts}  {text}\n", tag)
         self.log_box.see("end")
         self.log_box.config(state="disabled")
+
+    # ── channel name helpers ──────────────────────────────────────────────
+    def _ch_name(self, ch):
+        """Return the user-assigned label for a channel, or 'Ch <n>' if none set."""
+        return self._ch_names.get(ch, f"Ch {ch}")
+
+    def _open_name_channels(self):
+        channels = self._parse_channels()
+        if not channels:
+            messagebox.showinfo("No channels",
+                "Enter channel numbers in the Channels field first, then name them.")
+            return
+        def on_save(names):
+            self._ch_names = names
+            # Refresh treeview Ch column to reflect new names
+            for row in self._rows:
+                iid = row.get("iid")
+                if iid and self.tree.exists(iid):
+                    vals = list(self.tree.item(iid, "values"))
+                    vals[1] = self._ch_name(row["ch"])
+                    self.tree.item(iid, values=vals)
+            named = [f"Ch {ch} → {name}" for ch, name in names.items()]
+            if named:
+                self._q.put(("log", "Channel names saved: " + "  |  ".join(named), "ok"))
+            else:
+                self._q.put(("log", "Channel names cleared — using defaults.", "info"))
+        ChannelNamesDialog(self, channels, self._ch_names, on_save)
 
     # ── helpers ───────────────────────────────────────────────────────────
     def _toggle_convert(self):
@@ -717,6 +807,11 @@ class App(tk.Tk):
         self._q.put(("log",
             f"Detected {len(found)} channel(s): {ch_str} — Channels field updated.",
             "ok"))
+        if messagebox.askyesno("Name Channels",
+                f"Found {len(found)} channel(s): {ch_str}.\n\n"
+                "Would you like to give them friendly names now?\n"
+                "(e.g. Ch 2 → Front Gate)"):
+            self._open_name_channels()
 
     # ── List Available Dates ──────────────────────────────────────────────
     def _do_list_dates(self):
@@ -728,36 +823,33 @@ class App(tk.Tk):
         self.btn_list_dates.config(state="disabled")
         self.btn_search.config(state="disabled")
         self._q.put(("log",
-            f"Scanning last 30 days for recordings on channels {channels} …", "info"))
+            f"Scanning all available recordings on channels {channels} …", "info"))
 
         threading.Thread(
             target=self._list_dates_worker, args=(channels,), daemon=True).start()
 
     def _list_dates_worker(self, channels):
         """
-        Query each channel for the past 30 days, collect which dates have recordings.
-        Uses day-by-day queries to avoid huge result sets.
+        Query each channel for ALL available recordings (no fixed day limit).
+        Uses a start date far in the past so the NVR returns its full history.
         """
-        today     = datetime.now(timezone.utc).replace(
-                        hour=0, minute=0, second=0, microsecond=0)
-        date_range = [today - timedelta(days=i) for i in range(30)]
+        today = datetime.now(timezone.utc).replace(
+                    hour=0, minute=0, second=0, microsecond=0)
+        # Go back 10 years — NVR will simply return whatever it actually has
+        start = datetime(today.year - 10, 1, 1, tzinfo=timezone.utc)
+        end   = today + timedelta(days=1)
 
         dates_by_ch = {ch: set() for ch in channels}
         errors = []
 
         for ch in channels:
             self._q.put(("log", f"  Scanning channel {ch} …", "info"))
-            # Query the full 30-day window; search_recordings paginates up to max_results
-            start = today - timedelta(days=30)
-            end   = today + timedelta(days=1)
             try:
-                segs = self.client.search_recordings(ch, start, end, max_results=2000)
+                segs = self.client.search_recordings(ch, start, end, max_results=5000)
                 for seg in segs:
                     if seg.start_time:
-                        # Parse date from "2024-01-23T14:05:00Z" → "2024-01-23"
                         try:
-                            d = seg.start_time[:10]
-                            dates_by_ch[ch].add(d)
+                            dates_by_ch[ch].add(seg.start_time[:10])
                         except Exception:
                             pass
                 self._q.put(("log",
@@ -778,12 +870,12 @@ class App(tk.Tk):
 
         total_dates = len({d for v in dates_by_ch.values() for d in v})
         self._q.put(("log",
-            f"Found recordings on {total_dates} distinct date(s) in the last 30 days.",
+            f"Found recordings on {total_dates} distinct date(s).",
             "ok"))
 
         if total_dates == 0:
             messagebox.showinfo("No recordings",
-                "No recordings found in the last 30 days for the specified channels.")
+                "No recordings found for the specified channels.")
             return
 
         def on_pick(date_str):
@@ -792,7 +884,7 @@ class App(tk.Tk):
             self._q.put(("log",
                 f"Date set to {date_str} — click Search Recordings to load.", "info"))
 
-        AvailableDatesDialog(self, dates_by_ch, on_pick)
+        AvailableDatesDialog(self, dates_by_ch, on_pick, ch_names=self._ch_names)
 
     def _on_list_dates_err(self, msg):
         self.btn_list_dates.config(state="normal")
@@ -853,7 +945,7 @@ class App(tk.Tk):
             size = f"{seg.size_mb:.1f} MB" if seg.size_mb > 0 else "?"
             iid  = self.tree.insert(
                 "", "end",
-                values=(CHK_ON, row["ch"],
+                values=(CHK_ON, self._ch_name(row["ch"]),
                         seg.start_time or "?",
                         seg.end_time   or "?",
                         dur, size),
