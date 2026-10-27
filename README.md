@@ -12,7 +12,7 @@ Includes a desktop **GUI** and an interactive **CLI** — no extra dependencies 
 - 📅 **Available dates browser** — scan the last 30 days and see which dates have recordings per channel
 - 📆 **Date range search** — search across multiple days in one go
 - ⏩ **Resume support** — interrupted downloads pick up where they left off (HTTP Range)
-- 📦 **MP4 conversion** — optional ffmpeg remux from `.ps` to `.mp4` after download (two-pass: audio then no-audio fallback)
+- 📦 **MP4 conversion** — optional ffmpeg remux from `.ps` to `.mp4` after download (three-pass: audio copy → AAC transcode → no-audio fallback)
 - 🚦 **Bandwidth limiting** — cap download speed to avoid saturating the network
 - ✅ **Multi-channel** — search and download several channels at once
 - 🔁 **Retry on network error** — 3 attempts with a 20-second countdown between each
@@ -25,8 +25,17 @@ Includes a desktop **GUI** and an interactive **CLI** — no extra dependencies 
 ## Requirements
 
 - Python 3.10+
-- [`pure_hik_client.py`](https://github.com/crazy3tr/OpenHik-DVR) — place in the same folder as these scripts
 - `ffmpeg` in PATH — only needed for MP4 conversion
+
+> `pure_hik_client.py` is included in this repo. It is based on
+> [`OpenHik-DVR`](https://github.com/crazy3tr/OpenHik-DVR) with the following improvements:
+> - `download_with_resume()` — HTTP Range resume support (used by both scripts)
+> - `ping()` — quick connectivity and auth check before starting a long operation
+> - `get_available_dates()` — scan which days have recordings without loading the full list
+> - `RecordingSegment.duration_seconds` — computed duration property, no need to parse timestamps manually
+> - `convert_to_mp4()` — fixed for ffmpeg 9.x (`-f mpeg`), three-pass audio strategy
+> - `get_video_channels()` — `videoInputEnabled` defaults to `True` when absent (older firmware)
+> - `listen_events()` — buffer capped at 64 KB to prevent unbounded growth on malformed events
 
 ### Installing ffmpeg
 
@@ -38,13 +47,22 @@ Includes a desktop **GUI** and an interactive **CLI** — no extra dependencies 
 
 > **Note:** ffmpeg 9.x or newer is recommended. Older builds may fail to read `.ps` files due to a demuxer name change (`mpegps` → `mpeg`).
 
+### MP4 audio conversion
+
+Hikvision devices can record audio in several formats. The conversion tries three passes in order:
+
+| Pass | Video | Audio | When it succeeds |
+|---|---|---|---|
+| 1 | copy | copy | Source is already AAC — lossless, fastest |
+| 2 | copy | transcode → AAC 128k | Source is G.711 / G.722 / G.725 / PCM |
+| 3 | copy | dropped | Audio track missing or unreadable |
+
 ---
 
 ## Quick Start
 
 1. Clone or download this repo.
-2. Copy `pure_hik_client.py` from [OpenHik-DVR](https://github.com/crazy3tr/OpenHik-DVR) into the same folder.
-3. Run the GUI:
+2. Run the GUI:
 
 ```bash
 python hikvision_gui.py
@@ -113,7 +131,7 @@ Should work with any Hikvision device that supports:
 
 ## Credits
 
-- Uses [`OpenHik-DVR`](https://github.com/crazy3tr/OpenHik-DVR) (`pure_hik_client.py`) for ISAPI communication and Digest Auth.
+- Based on [`OpenHik-DVR`](https://github.com/crazy3tr/OpenHik-DVR) by crazy3tr for ISAPI communication and Digest Auth.
 
 ---
 
