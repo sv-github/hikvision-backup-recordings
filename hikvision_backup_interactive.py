@@ -57,11 +57,18 @@ def progress(downloaded_bytes: int, speed_mbs: float) -> None:
 
 def ps_to_mp4(ps_path: str, mp4_path: str, log) -> bool:
     """Convert a Hikvision .ps file to .mp4 using ffmpeg.
-    Tries audio-copy first, falls back to no-audio on failure."""
+
+    Hikvision devices record audio as AAC, G.711, G.722, G.725, or PCM.
+    MP4 supports AAC natively but not the others, so three passes are tried:
+      Pass 1 — copy video + copy audio  (lossless; works when source is AAC)
+      Pass 2 — copy video + transcode to AAC 128k  (for G.711/G.722/G.725/PCM)
+      Pass 3 — copy video, drop audio   (last resort)
+    """
     if not ps_path or not os.path.exists(ps_path):
         return False
     base_cmd = ["ffmpeg", "-y", "-f", "mpeg", "-i", ps_path]
     passes = [
+        base_cmd + ["-c:v", "copy", "-c:a", "copy", mp4_path],
         base_cmd + ["-c:v", "copy", "-c:a", "aac", "-b:a", "128k", mp4_path],
         base_cmd + ["-c:v", "copy", "-an", mp4_path],
     ]
@@ -281,14 +288,30 @@ def download_segments(client, segments, ch, date_str, save_dir,
         if os.path.exists(final) and os.path.getsize(final) > 0:
             size_match = re.search(r'[?&]size=(\d+)', seg.playback_uri)
             expected   = int(size_match.group(1)) if size_match else 0
-            if expected == 0 or os.path.getsize(final) >= expected:
+            already_complete = (expected == 0 or os.path.getsize(final) >= expected)
+            # If .ps is complete but .mp4 still needed, don't skip — fall through to convert
+            mp4_needed = convert and not os.path.exists(dest_mp4)
+            if already_complete and not mp4_needed:
                 log.info(f"  [{idx}/{len(segments)}] Skip (complete): {os.path.basename(final)}")
                 total_ok += 1
                 continue
 
+        # .ps already downloaded but .mp4 missing — convert without re-downloading
+        ps_complete = os.path.exists(dest_ps) and os.path.getsize(dest_ps) > 0
+        if convert and ps_complete and not os.path.exists(dest_mp4):
+            log.info(f"  [{idx}/{len(segments)}] Converting (already downloaded): {base_name}.ps")
+            ok = ps_to_mp4(dest_ps, dest_mp4, log)
+            if ok:
+                log.info(f"    ✓ {dest_mp4}")
+                if not keep_raw:
+                    os.remove(dest_ps)
+                total_ok += 1
+            else:
+                total_err += 1
+            continue
+
         size_str = f"{seg.size_mb:.1f} MB" if seg.size_mb > 0 else "?"
-        existing = os.path.exists(dest_ps) and os.path.getsize(dest_ps) > 0
-        action   = "Resuming" if existing else "Downloading"
+        action   = "Resuming" if ps_complete else "Downloading"
         log.info(f"  [{idx}/{len(segments)}] {action} {base_name}.ps  ({size_str})")
 
         os.makedirs(dest_dir, exist_ok=True)

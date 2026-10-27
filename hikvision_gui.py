@@ -1022,6 +1022,7 @@ class App(tk.Tk):
         base_cmd = ["ffmpeg", "-y", "-f", "mpeg", "-i", ps_path]
 
         passes = [
+            base_cmd + ["-c:v", "copy", "-c:a", "copy", mp4_path],
             base_cmd + ["-c:v", "copy", "-c:a", "aac", "-b:a", "128k", mp4_path],
             base_cmd + ["-c:v", "copy", "-an", mp4_path],
         ]
@@ -1483,7 +1484,9 @@ class App(tk.Tk):
                 m = re.search(r'[?&]size=(\d+)', seg.playback_uri)
                 exp = int(m.group(1)) if m else 0
                 already_complete = (exp == 0 or os.path.getsize(final) >= exp)
-                if already_complete or skip_existing:
+                # If .ps is complete but .mp4 still needed, don't skip — fall through to convert
+                mp4_needed = convert and not os.path.exists(mp4)
+                if (already_complete or skip_existing) and not mp4_needed:
                     reason = "complete" if already_complete else "exists (skip)"
                     self._q.put(("log",
                         f"[{idx}/{total}] Skip ({reason}): {os.path.basename(final)}",
@@ -1493,7 +1496,28 @@ class App(tk.Tk):
                     self._q.put(("overall_prog", done, total))
                     continue
 
-            resuming = (not skip_existing) and os.path.exists(ps) and os.path.getsize(ps) > 0
+            ps_complete = os.path.exists(ps) and os.path.getsize(ps) > 0
+
+            # .ps already downloaded but .mp4 missing — convert without re-downloading
+            if convert and ps_complete and not os.path.exists(mp4):
+                self._q.put(("log",
+                    f"[{idx}/{total}] Converting (already downloaded): {base}.ps", "info"))
+                ok = self._ps_to_mp4(ps, mp4)
+                if ok:
+                    self._q.put(("log", f"    ✓ {mp4}", "ok"))
+                    if not keep_raw:
+                        try:
+                            os.remove(ps)
+                        except Exception:
+                            pass
+                    ok_ct += 1
+                else:
+                    err_ct += 1
+                done += 1
+                self._q.put(("overall_prog", done, total))
+                continue
+
+            resuming = (not skip_existing) and ps_complete
             action   = "Resuming" if resuming else "Downloading"
             size_s   = f"{seg.size_mb:.1f} MB" if seg.size_mb > 0 else "?"
             self._q.put(("log",
